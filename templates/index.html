@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Login</title>
+
+  <link
+    rel="stylesheet"
+    href="{{ url_for('static', filename='css/index.css') }}"
+  />
+</head>
+
+<body>
+  <div class="login-wrapper">
+
+    <div class="login-card">
+
+      <div class="login-logo">
+        <img
+          src="{{ url_for('static', filename='media/chatbox.png') }}"
+          alt="ChatBox"
+        >
+      </div>
+
+      {% if error %}
+        <p class="login-error">{{ error }}</p>
+      {% endif %}
+
+      <form method="POST" class="login-form">
+        <input
+          type="text"
+          name="username"
+          placeholder="ユーザーネーム"
+          required
+          autocomplete="username"
+        >
+
+        <input
+          type="password"
+          name="password"
+          placeholder="パスワード"
+          required
+          autocomplete="current-password"
+        >
+
+        <button type="submit">ログイン</button>
+      </form>
+
+      <p class="register-link">
+        アカウントをお持ちでない方は
+        <a href="{{ url_for('register') }}">ここで登録</a>
+      </p>
+
+    </div>
+
+  </div>
+</body>
+</html>

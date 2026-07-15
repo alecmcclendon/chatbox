@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Register</title>
+
+  <link
+    rel="stylesheet"
+    href="{{ url_for('static', filename='css/register.css') }}"
+  />
+</head>
+
+<body>
+  <div class="register-wrapper">
+
+    <div class="register-card">
+
+      <h1 class="register-title">新規登録</h1>
+
+      {% if message %}
+        <p class="register-message">{{ message }}</p>
+      {% endif %}
+
+      <form method="POST" class="register-form">
+        <input
+          type="text"
+          name="username"
+          placeholder="ユーザーネームを決める"
+          required
+          autocomplete="username"
+        >
+
+        <input
+          type="password"
+          name="password"
+          placeholder="パスワードを決める"
+          required
+          autocomplete="new-password"
+        >
+
+        <button type="submit">登録</button>
+      </form>
+
+      <p class="login-link">
+        すでにアカウントをお持ちの方は
+        <a href="{{ url_for('login') }}">ログインへ戻る</a>
+      </p>
+
+    </div>
+
+  </div>
+</body>
+</html>
