@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta
+from threading import RLock
 from zoneinfo import ZoneInfo
 import os
 import sqlite3
 
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
-from flask_socketio import SocketIO, join_room, emit
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -43,9 +44,25 @@ ROOMS = [
     "ニュース",
 ]
 
-room_users = {}
+# room_connections:
+# {
+#     "room name": {
+#         "socket id": "username",
+#     }
+# }
+room_connections = {}
+
+# socket_memberships:
+# {
+#     "socket id": {
+#         "username": "name",
+#         "room": "room name",
+#     }
+# }
+socket_memberships = {}
+
 chat_history = {}
-user_connections = {}
+presence_lock = RLock()
 
 
 def get_db_connection():
@@ -106,6 +123,144 @@ def authenticate_user(username, password):
             conn.commit()
 
     return True
+
+
+def get_room_usernames(room):
+    """Return each online username once, even if they have multiple tabs."""
+    with presence_lock:
+        usernames = set(room_connections.get(room, {}).values())
+
+    return sorted(usernames)
+
+
+def broadcast_user_list(room):
+    """Send the latest online-user list to everyone currently in a room."""
+    socketio.emit(
+        "user_list",
+        {"users": get_room_usernames(room)},
+        room=room,
+    )
+
+
+def add_socket_to_room(sid, username, room):
+    """
+    Record one socket as being in exactly one room.
+
+    Returns True when this is the username's first active socket in the room.
+    """
+    with presence_lock:
+        connections = room_connections.setdefault(room, {})
+        username_already_present = username in connections.values()
+
+        connections[sid] = username
+        socket_memberships[sid] = {
+            "username": username,
+            "room": room,
+        }
+
+    return not username_already_present
+
+
+def remove_socket_membership(sid, announce=True):
+    """
+    Remove one socket from its room.
+
+    The username disappears only after its final tab/socket leaves that room.
+    Returns the removed membership, or None when the socket was not tracked.
+    """
+    with presence_lock:
+        membership = socket_memberships.pop(sid, None)
+
+        if not membership:
+            return None
+
+        username = membership["username"]
+        room = membership["room"]
+        connections = room_connections.get(room)
+
+        if connections is not None:
+            connections.pop(sid, None)
+            username_still_present = username in connections.values()
+
+            if not connections:
+                room_connections.pop(room, None)
+        else:
+            username_still_present = False
+
+    if announce and not username_still_present:
+        socketio.emit(
+            "status",
+            {"msg": f"{username} left."},
+            room=room,
+        )
+
+    broadcast_user_list(room)
+    return membership
+
+
+def remove_user_from_online_lists(username, disconnect_sockets=False):
+    """Remove all sockets belonging to a username from every room."""
+    with presence_lock:
+        matching_sids = [
+            sid
+            for sid, membership in socket_memberships.items()
+            if membership["username"] == username
+        ]
+
+    affected_rooms = set()
+
+    for sid in matching_sids:
+        membership = remove_socket_membership(sid, announce=False)
+        if membership:
+            affected_rooms.add(membership["room"])
+
+    for room in affected_rooms:
+        socketio.emit(
+            "status",
+            {"msg": f"{username} left."},
+            room=room,
+        )
+        broadcast_user_list(room)
+
+    if disconnect_sockets:
+        for sid in matching_sids:
+            try:
+                socketio.server.disconnect(sid, namespace="/")
+            except Exception:
+                # A tab may already have disconnected naturally.
+                pass
+
+
+def rename_online_user(current_username, new_username):
+    """Update the username attached to every active socket."""
+    affected_rooms = set()
+
+    with presence_lock:
+        for sid, membership in socket_memberships.items():
+            if membership["username"] != current_username:
+                continue
+
+            room = membership["room"]
+            membership["username"] = new_username
+
+            connections = room_connections.get(room)
+            if connections and sid in connections:
+                connections[sid] = new_username
+
+            affected_rooms.add(room)
+
+    for room in affected_rooms:
+        socketio.emit(
+            "status",
+            {
+                "msg": (
+                    f"{current_username} が {new_username} に"
+                    "ユーザー名を変更しました。"
+                )
+            },
+            room=room,
+        )
+        broadcast_user_list(room)
 
 
 init_db()
@@ -182,32 +337,12 @@ def mainchat(room):
     )
 
 
-def remove_user_from_online_lists(username):
-    for room_name, users in list(room_users.items()):
-        if username in users:
-            users.remove(username)
-
-            socketio.emit(
-                "status",
-                {"msg": f"{username} left."},
-                room=room_name,
-            )
-
-            socketio.emit(
-                "user_list",
-                {"users": sorted(users)},
-                room=room_name,
-            )
-
-    user_connections.pop(username, None)
-
-
 @app.route("/logout", methods=["POST"])
 def logout():
     username = session.get("username")
 
     if username:
-        remove_user_from_online_lists(username)
+        remove_user_from_online_lists(username, disconnect_sockets=True)
 
     session.clear()
 
@@ -305,31 +440,7 @@ def change_username():
         ), 400
 
     session["username"] = new_username
-
-    for room_name, users in list(room_users.items()):
-        if current_username in users:
-            users.remove(current_username)
-            users.add(new_username)
-
-            socketio.emit(
-                "status",
-                {
-                    "msg": (
-                        f"{current_username} が {new_username} に"
-                        "ユーザー名を変更しました。"
-                    )
-                },
-                room=room_name,
-            )
-
-            socketio.emit(
-                "user_list",
-                {"users": sorted(users)},
-                room=room_name,
-            )
-
-    if current_username in user_connections:
-        user_connections[new_username] = user_connections.pop(current_username)
+    rename_online_user(current_username, new_username)
 
     target_room = request.args.get("room", "メイン")
 
@@ -391,7 +502,7 @@ def delete_account():
         )
         conn.commit()
 
-    remove_user_from_online_lists(input_username)
+    remove_user_from_online_lists(input_username, disconnect_sockets=True)
     session.clear()
 
     return jsonify(
@@ -406,15 +517,32 @@ def delete_account():
 def handle_join(data):
     username = session.get("username")
     room = data.get("room") if data else None
+    sid = request.sid
 
     if not username or room not in ROOMS:
         return
 
-    join_room(room)
+    with presence_lock:
+        previous = socket_memberships.get(sid)
+        previous = previous.copy() if previous else None
 
-    already = username in room_users.get(room, set())
-    room_users.setdefault(room, set()).add(username)
-    user_connections[username] = request.sid
+    # A single Socket.IO connection can only belong to one chat room here.
+    if previous and previous["room"] != room:
+        old_room = previous["room"]
+        leave_room(old_room)
+        remove_socket_membership(sid)
+
+    elif previous and previous["room"] == room:
+        # Ignore duplicate join events, but refresh this tab's user list.
+        emit(
+            "user_list",
+            {"users": get_room_usernames(room)},
+            to=sid,
+        )
+        return
+
+    join_room(room)
+    first_socket_for_user = add_socket_to_room(sid, username, room)
 
     for message in chat_history.get(room, []):
         emit(
@@ -424,31 +552,58 @@ def handle_join(data):
                 "message": message["message"],
                 "timestamp": message["timestamp"].isoformat(),
             },
-            to=request.sid,
+            to=sid,
         )
 
-    if not already:
-        emit("status", {"msg": f"{username} joined."}, room=room)
+    if first_socket_for_user:
+        emit(
+            "status",
+            {"msg": f"{username} joined."},
+            room=room,
+        )
 
-    emit(
-        "user_list",
-        {"users": sorted(room_users[room])},
-        room=room,
-    )
+    broadcast_user_list(room)
+
+
+@socketio.on("leave")
+def handle_leave(data=None):
+    sid = request.sid
+
+    with presence_lock:
+        membership = socket_memberships.get(sid)
+        membership = membership.copy() if membership else None
+
+    if not membership:
+        return
+
+    leave_room(membership["room"])
+    remove_socket_membership(sid)
 
 
 @socketio.on("text")
 def handle_text(data):
     username = session.get("username")
-    room = data.get("room") if data else None
+    requested_room = data.get("room") if data else None
     text = data.get("message", "").strip() if data else ""
 
-    if not username or room not in ROOMS or not text:
+    if not username or requested_room not in ROOMS or not text:
+        return
+
+    with presence_lock:
+        membership = socket_memberships.get(request.sid)
+        membership = membership.copy() if membership else None
+
+    # Do not trust a room name supplied by a stale or modified browser tab.
+    if (
+        not membership
+        or membership["username"] != username
+        or membership["room"] != requested_room
+    ):
         return
 
     now = datetime.now(JST)
 
-    chat_history.setdefault(room, []).append(
+    chat_history.setdefault(requested_room, []).append(
         {
             "username": username,
             "message": text,
@@ -463,26 +618,15 @@ def handle_text(data):
             "message": text,
             "timestamp": now.isoformat(),
         },
-        room=room,
+        room=requested_room,
     )
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    username = session.get("username")
-
-    if not username:
-        return
-
-    this_sid = request.sid
-
-    def remove_if_still_gone():
-        socketio.sleep(5)
-
-        if user_connections.get(username) == this_sid:
-            remove_user_from_online_lists(username)
-
-    socketio.start_background_task(remove_if_still_gone)
+    # Immediate cleanup makes room changes feel responsive. If another tab for
+    # the same user remains in the room, the username stays in the list.
+    remove_socket_membership(request.sid)
 
 
 def clear_all_messages_at_midnight():
@@ -495,7 +639,6 @@ def clear_all_messages_at_midnight():
         socketio.sleep((next_midnight - now).total_seconds())
         chat_history.clear()
         socketio.emit("clear_messages")
-
 
 
 socketio.start_background_task(clear_all_messages_at_midnight)
